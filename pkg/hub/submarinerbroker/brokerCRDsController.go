@@ -3,13 +3,11 @@ package submarinerbroker
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/open-cluster-management/submariner-addon/pkg/helpers"
-	"github.com/open-cluster-management/submariner-addon/pkg/hub/submarinerbroker/bindata"
 	"github.com/openshift/library-go/pkg/assets"
 	"github.com/openshift/library-go/pkg/controller/factory"
 	"github.com/openshift/library-go/pkg/operator/events"
@@ -87,7 +85,11 @@ func (c *submarinerBrokerCRDsController) sync(ctx context.Context, syncCtx facto
 		clientHolder,
 		syncCtx.Recorder(),
 		func(name string) ([]byte, error) {
-			return assets.MustCreateAssetFromTemplate(name, bindata.MustAsset(filepath.Join("", name)), crdsConfig).Data, nil
+			template, err := manifestFiles.ReadFile(name)
+			if err != nil {
+				return nil, err
+			}
+			return assets.MustCreateAssetFromTemplate(name, template, crdsConfig).Data, nil
 		},
 		staticCRDFiles...,
 	)
