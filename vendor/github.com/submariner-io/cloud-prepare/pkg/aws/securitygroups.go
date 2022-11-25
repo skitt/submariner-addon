@@ -157,7 +157,6 @@ func (ac *awsCloud) createGatewaySG(vpcID string, ports []api.PortSpec) (string,
 					ResourceType: types.ResourceTypeSecurityGroup,
 					Tags: []types.Tag{
 						ec2Tag("Name", groupName),
-						ec2Tag(ac.withAWSInfo("kubernetes.io/cluster/{infraID}"), "owned"),
 					},
 				},
 			},
@@ -209,7 +208,7 @@ func (ac *awsCloud) deleteGatewaySG(vpcID string) error {
 			GroupId: gatewayGroupID,
 		})
 
-		return err // nolint:wrapcheck // Let the caller wrap it.
+		return err //nolint:wrapcheck // Let the caller wrap it.
 	})
 
 	if isAWSError(err, "InvalidPermission.NotFound") {
