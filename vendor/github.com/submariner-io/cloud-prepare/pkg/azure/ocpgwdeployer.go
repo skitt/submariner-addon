@@ -21,27 +21,25 @@ package azure
 import (
 	"bytes"
 	"context"
-	"strings"
 	"text/template"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2021-12-01/compute"
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2021-03-01/network"
-	"github.com/Azure/go-autorest/autorest"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork"
 	"github.com/pkg/errors"
 	"github.com/submariner-io/admiral/pkg/reporter"
 	"github.com/submariner-io/admiral/pkg/stringset"
 	"github.com/submariner-io/cloud-prepare/pkg/api"
 	"github.com/submariner-io/cloud-prepare/pkg/ocp"
-	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/serializer/yaml"
+	"k8s.io/apimachinery/pkg/util/uuid"
+	"k8s.io/utils/pointer"
 )
 
 const (
-	submarinerGatewayGW      = "subgw"
+	submarinerGatewayGW      = "subgw-"
 	azureVirtualMachines     = "virtualMachines"
-	topologyLabel            = "topology.kubernetes.io/zone"
 	submarinerGatewayNodeTag = "submariner-io-gateway-node"
 )
 
@@ -79,28 +77,36 @@ func (d *ocpGatewayDeployer) Deploy(input api.GatewayDeployInput, status reporte
 
 	status.Start("Deploying gateway node")
 
-	nsgClient := getNsgClient(d.SubscriptionID, d.Authorizer)
-	nwClient := getInterfacesClient(d.SubscriptionID, d.Authorizer)
-	pubIPClient := getIPClient(d.SubscriptionID, d.Authorizer)
+	nsgClient, nwClient, pubIPClient, err := d.getClients(status)
+	if err != nil {
+		return err
+	}
+
 	groupName := d.InfraID + externalSecurityGroupSuffix
+
+	machineSets, err := d.msDeployer.List()
+	if err != nil {
+		return status.Error(err, "error getting the gateway machinesets")
+	}
 
 	gwNodes, err := d.azure.K8sClient.ListGatewayNodes()
 	if err != nil {
 		return errors.Wrap(err, "error getting the gateway node")
 	}
 
-	// Open the g/w ports and assign public-ip if not already done for manually tagged nodes if any
 	gwNodeItems := gwNodes.Items
-	gatewayNodesToDeploy := input.Gateways - len(gwNodeItems)
+	taggedExistingNodes := ocp.RemoveDuplicates(machineSets, gwNodeItems)
+	gatewayNodesToDeploy := input.Gateways - len(machineSets) - len(taggedExistingNodes)
 
-	if len(gwNodeItems) != 0 || gatewayNodesToDeploy != 0 {
+	if len(machineSets) != 0 || gatewayNodesToDeploy != 0 {
 		if err := d.createGWSecurityGroup(groupName, input.PublicPorts, nsgClient); err != nil {
 			return status.Error(err, "creating gateway security group failed")
 		}
 	}
 
+	// Open the g/w ports and assign public-ip if not already done for manually tagged nodes if any
 	for i := range gwNodeItems {
-		if err = d.prepareGWInterface(gwNodeItems[i].Name, groupName, nsgClient, nwClient, pubIPClient); err != nil {
+		if err = d.prepareGWInterface(gwNodeItems[i].GetName(), groupName, nsgClient, nwClient, pubIPClient); err != nil {
 			return status.Error(err, "failed to open the Submariner gateway port for already existing nodes")
 		}
 	}
@@ -119,7 +125,12 @@ func (d *ocpGatewayDeployer) Deploy(input api.GatewayDeployInput, status reporte
 	}
 
 	if d.dedicatedGWNode {
-		err = d.deployDedicatedGWNode(gwNodeItems, gatewayNodesToDeploy, status)
+		image, imageErr := d.msDeployer.GetWorkerNodeImage(nil, nil, d.InfraID)
+		if imageErr != nil {
+			return errors.Wrap(imageErr, "error retrieving worker node image")
+		}
+
+		err = d.deployDedicatedGWNode(machineSets, gatewayNodesToDeploy, image, status)
 	} else {
 		err = d.tagExistingNode(nsgClient, nwClient, pubIPClient, gatewayNodesToDeploy, status)
 	}
@@ -131,7 +142,8 @@ func (d *ocpGatewayDeployer) Deploy(input api.GatewayDeployInput, status reporte
 	return err
 }
 
-func (d *ocpGatewayDeployer) deployDedicatedGWNode(gwNodes []v1.Node, gatewayNodesToDeploy int, status reporter.Interface,
+func (d *ocpGatewayDeployer) deployDedicatedGWNode(gwNodes []unstructured.Unstructured, gatewayNodesToDeploy int,
+	image string, status reporter.Interface,
 ) error {
 	az, err := d.getAvailabilityZones(gwNodes)
 	if err != nil || az.Size() == 0 {
@@ -141,7 +153,7 @@ func (d *ocpGatewayDeployer) deployDedicatedGWNode(gwNodes []v1.Node, gatewayNod
 	for _, zone := range az.Elements() {
 		status.Start("Deploying dedicated gateway node")
 
-		err := d.deployGateway(zone)
+		err := d.deployGateway(zone, image)
 		if err != nil {
 			return status.Error(err, "error deploying gateway for zone %q", zone)
 		}
@@ -160,8 +172,8 @@ func (d *ocpGatewayDeployer) deployDedicatedGWNode(gwNodes []v1.Node, gatewayNod
 	return nil
 }
 
-func (d *ocpGatewayDeployer) tagExistingNode(nsgClient *network.SecurityGroupsClient, nwClient *network.InterfacesClient,
-	pubIPClient *network.PublicIPAddressesClient, gatewayNodesToDeploy int, status reporter.Interface,
+func (d *ocpGatewayDeployer) tagExistingNode(nsgClient *armnetwork.SecurityGroupsClient, nwClient *armnetwork.InterfacesClient,
+	pubIPClient *armnetwork.PublicIPAddressesClient, gatewayNodesToDeploy int, status reporter.Interface,
 ) error {
 	groupName := d.InfraID + externalSecurityGroupSuffix
 
@@ -210,9 +222,10 @@ type machineSetConfig struct {
 	InfraID      string
 	InstanceType string
 	Region       string
+	Image        string
 }
 
-func (d *ocpGatewayDeployer) loadGatewayYAML(name, zone string) ([]byte, error) {
+func (d *ocpGatewayDeployer) loadGatewayYAML(name, zone, image string) ([]byte, error) {
 	var buf bytes.Buffer
 
 	tpl, err := template.New("").Parse(machineSetYAML)
@@ -226,6 +239,7 @@ func (d *ocpGatewayDeployer) loadGatewayYAML(name, zone string) ([]byte, error) 
 		InstanceType: d.instanceType,
 		Region:       d.azure.Region,
 		AZ:           zone,
+		Image:        image,
 	}
 
 	err = tpl.Execute(&buf, tplVars)
@@ -236,8 +250,8 @@ func (d *ocpGatewayDeployer) loadGatewayYAML(name, zone string) ([]byte, error) 
 	return buf.Bytes(), nil
 }
 
-func (d *ocpGatewayDeployer) initMachineSet(name, zone string) (*unstructured.Unstructured, error) {
-	gatewayYAML, err := d.loadGatewayYAML(name, zone)
+func (d *ocpGatewayDeployer) initMachineSet(name, zone, image string) (*unstructured.Unstructured, error) {
+	gatewayYAML, err := d.loadGatewayYAML(name, zone, image)
 	if err != nil {
 		return nil, err
 	}
@@ -254,10 +268,8 @@ func (d *ocpGatewayDeployer) initMachineSet(name, zone string) (*unstructured.Un
 	return machineSet, nil
 }
 
-func (d *ocpGatewayDeployer) deployGateway(zone string) error {
-	name := d.azure.InfraID + submarinerGatewayGW + d.azure.Region + "-" + zone
-
-	machineSet, err := d.initMachineSet(name, zone)
+func (d *ocpGatewayDeployer) deployGateway(zone, image string) error {
+	machineSet, err := d.initMachineSet(MachineName(d.azure.Region), zone, image)
 	if err != nil {
 		return err
 	}
@@ -265,30 +277,58 @@ func (d *ocpGatewayDeployer) deployGateway(zone string) error {
 	return errors.Wrapf(d.msDeployer.Deploy(machineSet), "error deploying machine set %q", machineSet.GetName())
 }
 
-func (d *ocpGatewayDeployer) getAvailabilityZones(gwNodes []v1.Node) (stringset.Interface, error) {
+// MachineName generates a machine name for the gateway.
+// The name length is limited to 20 characters to ensure we don't hit the 63-character limit
+// when generating the "machine public IP name".
+// At most 7 characters for the region,
+// at most 13 for the region and a randomly generated UUID.
+// We add "subgw-", 6 characters, for a total of 20 with the hyphen between region and UUID.
+func MachineName(region string) string {
+	if len(region) > 7 {
+		region = region[0:7]
+	}
+
+	return submarinerGatewayGW + region + "-" + string(uuid.NewUUID())[0:6]
+}
+
+func (d *ocpGatewayDeployer) getAvailabilityZones(gwNodes []unstructured.Unstructured) (stringset.Interface, error) {
 	zonesWithSubmarinerGW := stringset.New()
 
 	for i := range gwNodes {
-		zonesWithSubmarinerGW.Add(gwNodes[i].GetLabels()[topologyLabel])
+		zone, _, err := unstructured.NestedString(gwNodes[i].Object, "spec", "template", "spec", "providerSpec", "value", "zone")
+		if err != nil {
+			return nil, errors.Wrap(err, "error getting the zone from the existing node")
+		}
+
+		zonesWithSubmarinerGW.Add(zone)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
 	defer cancel()
 
-	resourceSKUClient := getResourceSkuClient(d.azure.SubscriptionID, d.azure.Authorizer)
-
-	resourceSKUs, err := resourceSKUClient.List(ctx, d.azure.Region, "")
+	resourceSKUClient, err := d.getResourceSKUClient()
 	if err != nil {
-		return nil, errors.Wrapf(err, "error getting the resource sku in the regiom %q", d.azure.Region)
+		return nil, errors.Wrap(err, "Failed to get resource SKU client")
 	}
+
+	pager := resourceSKUClient.NewListPager(&armcompute.ResourceSKUsClientListOptions{
+		Filter: pointer.String(d.azure.Region),
+	})
 
 	eligibleZonesForSubmarinerGW := stringset.New()
 
-	for _, resourceSKUValue := range resourceSKUs.Values() {
-		if *resourceSKUValue.ResourceType == azureVirtualMachines && *resourceSKUValue.Name == d.instanceType {
-			for _, zone := range *(*resourceSKUValue.LocationInfo)[0].Zones {
-				if !zonesWithSubmarinerGW.Contains(d.azure.Region + "-" + zone) {
-					eligibleZonesForSubmarinerGW.Add(zone)
+	for pager.More() {
+		nextResult, err := pager.NextPage(ctx)
+		if err != nil {
+			return nil, errors.Wrapf(err, "error paging the resource SKUs in the regiom %q", d.azure.Region)
+		}
+
+		for _, resourceSKU := range nextResult.Value {
+			if *resourceSKU.ResourceType == azureVirtualMachines && *resourceSKU.Name == d.instanceType {
+				for _, zone := range resourceSKU.LocationInfo[0].Zones {
+					if !zonesWithSubmarinerGW.Contains(d.azure.Region + "-" + *zone) {
+						eligibleZonesForSubmarinerGW.Add(*zone)
+					}
 				}
 			}
 		}
@@ -300,16 +340,23 @@ func (d *ocpGatewayDeployer) getAvailabilityZones(gwNodes []v1.Node) (stringset.
 func (d *ocpGatewayDeployer) Cleanup(status reporter.Interface) error {
 	status.Start("Removing gateway node")
 
-	nsgClient := getNsgClient(d.SubscriptionID, d.Authorizer)
-	nwClient := getInterfacesClient(d.SubscriptionID, d.Authorizer)
+	nsgClient, err := d.getNsgClient()
+	if err != nil {
+		return status.Error(err, "Failed to get network security groups client")
+	}
+
+	nwClient, err := d.getInterfacesClient()
+	if err != nil {
+		return status.Error(err, "Failed to get network interfaces client")
+	}
 
 	if err := d.cleanupGWInterface(d.InfraID, nsgClient, nwClient); err != nil {
 		return status.Error(err, "deleting gateway security group failed")
 	}
 
-	err := d.deleteGateway()
+	err = d.deleteGateway(status)
 	if err != nil {
-		return status.Error(err, "removing gateway node failed")
+		return err
 	}
 
 	status.Success("Removed gateway node")
@@ -317,58 +364,82 @@ func (d *ocpGatewayDeployer) Cleanup(status reporter.Interface) error {
 	return nil
 }
 
-func (d *ocpGatewayDeployer) deleteGateway() error {
-	gwNodes, err := d.azure.K8sClient.ListGatewayNodes()
+func (d *ocpGatewayDeployer) deleteGateway(status reporter.Interface) error {
+	machineSetList, err := d.msDeployer.List()
 	if err != nil {
-		return errors.Wrapf(err, "error getting the gw nodes")
+		return status.Error(err, "error listing the Submariner gateway nodes")
 	}
 
-	gwNodesList := gwNodes.Items
-	pubIPClient := getIPClient(d.SubscriptionID, d.Authorizer)
+	pubIPClient, err := d.getPublicIPClient()
+	if err != nil {
+		return errors.Wrapf(err, "Failed to get network public IP addresses client")
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
 	defer cancel()
 
-	for i := 0; i < len(gwNodesList); i++ {
-		if !strings.Contains(gwNodesList[i].Name, submarinerGatewayGW) {
-			err = d.K8sClient.RemoveGWLabelFromWorkerNode(&gwNodesList[i])
-			if err != nil {
-				return errors.Wrapf(err, "failed to remove labels from worker node")
-			}
+	for i := range machineSetList {
+		status.Start("Deleting the gateway instance %q", machineSetList[i].GetName())
 
-			publicIPName := gwNodesList[i].Name + "-pub"
+		err = d.msDeployer.DeleteByName(machineSetList[i].GetName(), machineSetList[i].GetNamespace())
+		if err != nil {
+			return status.Error(err, "error deleting the gateway instance from node: %q",
+				machineSetList[i].GetName())
+		}
 
-			err = d.DeletePublicIP(ctx, pubIPClient, publicIPName)
-			if err != nil {
-				return errors.Wrapf(err, "failed to delete public-ip")
-			}
-		} else {
-			machineSetName := gwNodesList[i].Name[:strings.LastIndex(gwNodesList[i].Name, "-")]
-			prefix := machineSetName[:strings.LastIndex(gwNodesList[i].Name, "-")]
-			zone := machineSetName[strings.LastIndex(gwNodesList[i].Name, "-")-1:]
+		publicIPName := machineSetList[i].GetName() + "-pub"
 
-			machineSet, err := d.initMachineSet(prefix, zone)
-			if err != nil {
-				return err
-			}
+		err = d.deletePublicIP(ctx, pubIPClient, publicIPName)
+		if err != nil {
+			return status.Error(err, "failed to delete public-ip %q", publicIPName)
+		}
 
-			return errors.Wrapf(d.msDeployer.Delete(machineSet), "error deleting machine set %q", machineSet.GetName())
+		status.Success("Successfully deleted the instance")
+	}
+
+	// Cleanup nodes that are not dedicated gateway nodes.
+	gwNodesList, err := d.K8sClient.ListGatewayNodes()
+	if err != nil {
+		return status.Error(err, "error listing the Submariner gateway nodes")
+	}
+
+	gwNodes := ocp.RemoveDuplicates(machineSetList, gwNodesList.Items)
+
+	for i := range gwNodes {
+		err = d.K8sClient.RemoveGWLabelFromWorkerNode(&gwNodes[i])
+
+		if err != nil {
+			return status.Error(err, "failed to cleanup node %q", gwNodes[i].Name)
+		}
+
+		publicIPName := gwNodes[i].Name + "-pub"
+
+		err = d.deletePublicIP(ctx, pubIPClient, publicIPName)
+		if err != nil {
+			return status.Error(err, "failed to delete public-ip")
 		}
 	}
 
 	return nil
 }
 
-func getResourceSkuClient(subscriptionID string, authorizer autorest.Authorizer) *compute.ResourceSkusClient {
-	resourceSkusClient := compute.NewResourceSkusClient(subscriptionID)
-	resourceSkusClient.Authorizer = authorizer
+func (d *ocpGatewayDeployer) getClients(status reporter.Interface) (
+	*armnetwork.SecurityGroupsClient, *armnetwork.InterfacesClient, *armnetwork.PublicIPAddressesClient, error,
+) {
+	nsgClient, err := d.getNsgClient()
+	if err != nil {
+		return nil, nil, nil, status.Error(err, "Failed to get network security groups client")
+	}
 
-	return &resourceSkusClient
-}
+	nwClient, err := d.getInterfacesClient()
+	if err != nil {
+		return nil, nil, nil, status.Error(err, "Failed to get network interfaces client")
+	}
 
-func getIPClient(subscriptionID string, authorizer autorest.Authorizer) *network.PublicIPAddressesClient {
-	ipClient := network.NewPublicIPAddressesClient(subscriptionID)
-	ipClient.Authorizer = authorizer
+	pubIPClient, err := d.getPublicIPClient()
+	if err != nil {
+		return nil, nil, nil, status.Error(err, "Failed to get network public IP addresses client")
+	}
 
-	return &ipClient
+	return nsgClient, nwClient, pubIPClient, nil
 }
